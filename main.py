@@ -4,7 +4,8 @@ from pathlib import Path
 import hashlib
 import zlib
 import sys
-from typing import Dict, List, Optional, Tuple
+import time
+from typing import Dict, List, Tuple
 
 import json
 
@@ -55,6 +56,84 @@ class Tree(GitObject):
             content += bytes.fromhex(objHash)
         
         return content
+
+    def addEntry(self, mode: str, name: str, objHash: str):
+        self.entries.append(mode, name, objHash)
+        self.content = self._serialiseEntries()
+        
+    @classmethod
+    def fromContent(cls, content: bytes) -> Tree:
+        tree = cls()
+        i = 0
+        while i < len(content):
+            nullIdx = content.find(b"\0", i)
+            if nullIdx == -1:
+                break
+            
+            modeAndName = content[i:nullIdx]
+            mode, name = modeAndName.split(" ", 1)
+            objHash = content[nullIdx + 1: nullIdx + 21]. hex()
+            tree.entries.append((mode, name, objHash))
+            
+            i = nullIdx + 21
+            
+        return tree
+
+class Commit(GitObject):
+    def __init__(self, treeHash: str, parentHashes: List[str], 
+                 author: str, committer: str, message: str, timestamp: int = None):
+        self.treeHash = treeHash
+        self.parentHashes = parentHashes
+        self.author = author
+        self.committer = committer
+        self.message = message
+        self.timestamp = timestamp or int(time.time())
+        content = self._serialiseCommit()
+        super().__init__("commit", content)
+        
+        
+    def _serialiseCommit(self):
+        # tree <tree hash> \n parent <parent hash> \n author <name> <timestamp> timezone
+        lines = [f"tree {self.treeHash}"]
+        for parent in self.parentHashes:
+            lines.append(f"parent {parent}")
+            
+        lines.append(f"author {self.author} {self.timestamp} +0000")
+        lines.append(f"committer {self.committer} {self.timestamp} +0000")
+        lines.append("")
+        lines.append(self.message)
+        
+        return "\n".join(lines).encode()
+    
+    @classmethod
+    def fromContent(cls, content : bytes) -> Commit:
+        lines = content.decode().split("\n")
+        treeHash = None
+        parentHashes = []
+        author = None
+        committer = None
+        messageStart = 0
+        
+        for i, line in enumerate(lines):
+            if line.startswith("tree "):
+                treeHash = lines[5:]
+            elif line.startswith("parent "):
+                parentHashes.append(line[7:])
+            elif line.startswith("author "):
+                authorParts = line[7:].rsplit(" ", 2)
+                author = authorParts[0]
+                timestamp = int(authorParts[1])
+            elif line.startswith("committer "):
+                committerParts = line[10:].rsplit(" ", 2)
+                committer = committerParts[0]
+            elif line == "":
+                messageStart = i+1
+                break
+        message = "\n".join(lines[messageStart:])
+        commit = cls(treeHash, parentHashes, author, committer, message, timestamp)
+        return commit
+        
+
 
 
 class Repository:
@@ -184,6 +263,15 @@ class Repository:
         else:
             raise ValueError(f"{path} is neither a file nor a directory" )
                 
+    def loadObject(self, objHash: str) -> GitObject:
+        objDir = self.objectDir / objHash[:2]
+        objFile = objDir / objHash[2:]
+        
+        if not objFile.exists():
+            raise FileNotFoundError(f"Object {objHash} not found")
+            
+        return GitObject.deserialise(objFile.read_bytes())
+            
             
     def createTreeFromIndex(self):
         index = self.loadIndex()
@@ -191,13 +279,98 @@ class Repository:
             tree = Tree()
             return self.storeObject(tree)
             
+        dirs = {}
+        files = {}
+        
+        for filePath, blobHash in index.items():
+            parts = filePath.split("/")
+            if len(parts) == 1:
+                files[parts[0]] = blobHash
+            else:
+                dirName = parts[0]
+                if dirName not in dirs:
+                    dirs[dirName] = {}
+                
+                current = dirs[dirName]
+                for part in parts[1:-1]:
+                    current[part] = {}
+                    
+                    current = current[part]
+                
+                current[parts[-1]] = blobHash
+                
+        def createTreeRecursive(entriesDict: Dict):
+            tree = Tree()
+            for name, blobHash in entriesDict.items():
+                if isinstance(blobHash, str):
+                    tree.addEntry("100644", name, blobHash)
+                if isinstance(blobHash, dict):
+                    subtreeHash = createTreeRecursive(blobHash)
+                    tree.addEntry("40000", name, subtreeHash)
+                    
+            return self.storeObject(tree)
+        
+        rootEntries = {**files}
+        for dirName, dirContent in dirs.items():
+            rootEntries[dirName] = dirContent
         pass
+    
+    def getCurrentBranch(self) -> str:
+        if not self.headFile.exists():
+            return "master"
+        headContent = self.headFile.read_text().strip()
+        if headContent.startswith("ref: refs/heads/"):
+            return headContent[16:]
+        
+        # detached HEAD
+        return "HEAD"
+    
+    def getBranchCommit(self, currentBranch: str):
+        branchFile = self.headsDir / currentBranch
+        
+        if branchFile.exists():
+            return branchFile.read_text().strip()
+        
+        return None
+    
+    def setBranchCommit(self, currentBranch: str, commitHash: str):
+        branchFile = self.headsDir / currentBranch
+        branchFile.write_text(commitHash + "\n")
+    
     
     def commit(self, message: str, author: str = "User"):
         # Create a tree object from the index
         treeHash = self.createTreeFromIndex()
         
-        pass
+        currentBranch = self.getCurrentBranch()
+        parentCommit = self.getBranchCommit(currentBranch)
+        parentHashes = [parentCommit] if parentCommit else []
+        
+        # If nothing was added
+        index = self.loadIndex()
+        if not index:
+            print("Nothing to commit, working tree clean") 
+            return None
+        
+        # If no changes are being committed
+        if parentCommit:
+            parentGitCommitObj = self.loadObject(parentCommit)
+            parentCommitContent = Commit.fromContent(parentGitCommitObj.content)
+            if treeHash == parentCommitContent.treeHash:
+                print("Nothing to commit, working tree clean")
+            
+        
+        commit = Commit(treeHash=treeHash, parentHashes=parentHashes, 
+                        author=author, committer=author, message=message)
+        
+        commitHash = self.storeObject(commit)
+        
+        # Branch commit with be updated with newest commit
+        self.setBranchCommit(currentBranch, commitHash)
+        self.saveIndex({})
+        print(f"Created commit {commitHash} on branch {currentBranch}")
+        return commitHash
+        
     
         
 def main():
