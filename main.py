@@ -28,7 +28,7 @@ class GitObject:
     def deserialise(cls, data: bytes) -> GitObject:
         decompressed = zlib.decompress(data)
         nullIdx = decompressed.find(b"\0")
-        header = decompressed[:nullIdx]
+        header = decompressed[:nullIdx].decode()
         content = decompressed[nullIdx + 1:]
         
         objType, _ = header.split(" ")
@@ -317,7 +317,7 @@ class Repository:
     
     def getCurrentBranch(self) -> str:
         if not self.headFile.exists():
-            return "master"
+            return "main"
         headContent = self.headFile.read_text().strip()
         if headContent.startswith("ref: refs/heads/"):
             return headContent[16:]
