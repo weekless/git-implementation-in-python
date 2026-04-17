@@ -372,6 +372,102 @@ class Repository:
         return commitHash
         
     
+    def getFileFromTree(self, treeHash: str, prefix: str = "") -> set:
+        files = set()
+        
+        try:
+            treeObj = self.loadObject(treeHash)
+            tree = Tree.fromContent(treeObj.content)
+            # list<tuple<str, str, str>>
+            for mode, name, objHash in tree.entries:
+                fullName = f"{prefix}{name}"
+                # file
+                if mode.startswith("100"):
+                    files.add(fullName)
+                # directory
+                elif mode.startswith("400"):
+                    subtreeFiles = self.getFileFromTree(objHash, f"{fullName}/")
+                    files.update(subtreeFiles)
+        except Exception as e:
+            print(f"Could not read tree {treeHash}: {e}")
+            
+        return files
+    
+    def checkout(self, branch: str, createBranch: bool):
+        # Computed the files to clear from the previous commit
+        previousBranch = self.getCurrentBranch()
+        filesToClear = set()
+        try:
+            previousCommitHash = self.getBranchCommit(previousBranch)
+            if previousCommitHash:
+                previousCommitObj = self.loadObject(previousCommitHash)
+                previousCommit = Commit.fromContent(previousCommitObj.content)
+                if previousCommit.treeHash:
+                    filesToClear = self.getFileFromTree(previousCommit.treeHash)
+        except Exception:
+            filesToClear = set()
+            
+        # Created a new branch 
+        branchFile = self.headsDir / branch
+        if not branchFile.exists():
+            if createBranch:
+                if previousCommitHash:
+                    self.setBranchCommit(branch, previousCommitHash)
+                    print(f"Created new branch {branch}")
+                else:
+                    print("No commits yet, cannot create a branch")
+                    return
+            else:
+                print(f"Branch '{branch}' not found")
+                print(f"Use 'checkout -b {branch}' to create and switch to new branch")
+                return 
+        self.headFile.write_text(f"ref: refs/heads/{branch}\n")
+        
+        # Restore working directory 
+        self.restoreWorkingDirectory(branch, filesToClear)
+        print(f"Switched to branch {branch}")
+    
+    def restoreTree(self, treeHash: str, path: str):
+        treeObj = self.loadObject(treeHash)
+        tree = Tree.fromContent(treeObj.content)
+        # list<tuple<str, str, str>>
+        for mode, name, objHash in tree.entries:
+            filePath = self.path / name
+            # file
+            if mode.startswith("100"):
+                blobObj = self.loadObject(objHash)
+                blob = Blob(blobObj.content)
+                filePath.write_bytes(blob.getContent())
+            # directory
+            elif mode.startswith("400"):
+                filePath.mkdir(exist_ok=True)
+                self.restoreTree(objHash, filePath)
+                
+    
+    def restoreWorkingDirectory(self, branch: str, filesToClear: set[str]):
+        targetCommitHash = self.getBranchCommit(branch)
+        if not targetCommitHash:
+            return
+        
+        # Remove files tracked by previous branch
+        for relPath in sorted(filesToClear):
+            filePath = self.path / relPath
+            try:
+                if filePath.is_file():
+                    filePath.unlink()
+                elif filePath.is_dir():
+                    if not any(filePath.iterdir()):
+                        filePath.rmdir()
+            except Exception:
+                pass
+            
+        targetCommitObj = self.loadObject(targetCommitHash)
+        targetCommit = Commit.fromContent(targetCommitObj)
+        
+        if targetCommit.treeHash:
+            self.restoreTree(targetCommit.treeHash, self.path)
+            
+        self.saveIndex({})
         
 def main():
     parser = argparse.ArgumentParser(description="PyGit")
@@ -388,6 +484,11 @@ def main():
     commitParser = subparser.add_parser("commit", help="Create a new commit")
     commitParser.add_argument("-m", "--message", help="Commit message", required=True)
     commitParser.add_argument("--author", help="Author name")
+    
+    # checkout command
+    checkoutParser = subparser.add_parser("checkout", help="Move/Create a new branch")
+    checkoutParser.add_argument("branch", help="Branch to switch to")
+    checkoutParser.add_argument("-b", "--create-branch", action="storeTrue")
     
     args = parser.parse_args()
     
@@ -414,6 +515,12 @@ def main():
                 return
             author = args.author or "User"
             repo.commit(args.message, author)
+        elif args.command == "checkout":
+            if not repo.gitDir.exists():
+                print("Not a git repository")
+                return
+            repo.checkout(args.branch, args.createBranch)
+            
                 
     except Exception as e:
         print(f"Error: {e}" )
